@@ -426,6 +426,7 @@ package com.revenuecat.purchases {
     method public void purchase(com.revenuecat.purchases.PurchaseParams purchaseParams, com.revenuecat.purchases.interfaces.PurchaseCallback callback);
     method @Deprecated public void purchasePackage(android.app.Activity activity, com.revenuecat.purchases.Package packageToPurchase, com.revenuecat.purchases.interfaces.PurchaseCallback listener);
     method @Deprecated public void purchaseProduct(android.app.Activity activity, com.revenuecat.purchases.models.StoreProduct storeProduct, com.revenuecat.purchases.interfaces.PurchaseCallback callback);
+    method @com.revenuecat.purchases.ExperimentalPreviewRevenueCatPurchasesAPI public void recoverPendingPurchase(String expectedAppUserID, String productId, java.util.Date purchaseStartedAt, com.revenuecat.purchases.interfaces.PurchaseCallback callback);
     method public void redeemWebPurchase(com.revenuecat.purchases.WebPurchaseRedemption webPurchaseRedemption, com.revenuecat.purchases.interfaces.RedeemWebPurchaseListener listener);
     method public void removeUpdatedCustomerInfoListener();
     method public void restorePurchases(com.revenuecat.purchases.interfaces.ReceiveCustomerInfoCallback callback);

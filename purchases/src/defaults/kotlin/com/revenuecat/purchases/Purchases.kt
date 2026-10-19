@@ -72,6 +72,7 @@ import com.revenuecat.purchases.virtualcurrencies.VirtualCurrencies
 import kotlinx.coroutines.CancellationException
 import org.json.JSONObject
 import java.net.URL
+import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import com.revenuecat.purchases.VerifiedReward as CoreVerifiedReward
@@ -322,6 +323,24 @@ public class Purchases internal constructor(
         listener: SyncPurchasesCallback? = null,
     ) {
         purchasesOrchestrator.syncPurchases(listener)
+    }
+
+    /**
+     * Recovers one interrupted manual-sync Google Play checkout after an explicit user action.
+     * The configured SDK must still belong to [expectedAppUserID], a named account. Only a unique purchased
+     * transaction matching [productId], the checkout time and Google's obfuscated account ID is posted.
+     * [PurchaseCallback.onCompleted] receives that exact transaction after RevenueCat acknowledges its receipt.
+     * Missing, pending, ambiguous or foreign transactions return an error; callers must retain their original intent.
+     * This does not recover historical anonymous ownership or already-consumed purchases absent from Play's query.
+     */
+    @ExperimentalPreviewRevenueCatPurchasesAPI
+    public fun recoverPendingPurchase(
+        expectedAppUserID: String,
+        productId: String,
+        purchaseStartedAt: Date,
+        callback: PurchaseCallback,
+    ) {
+        purchasesOrchestrator.recoverPendingPurchase(expectedAppUserID, productId, purchaseStartedAt, callback)
     }
 
     /**

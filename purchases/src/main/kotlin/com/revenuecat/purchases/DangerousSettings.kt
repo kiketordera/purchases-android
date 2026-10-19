@@ -12,8 +12,9 @@ import kotlinx.parcelize.Parcelize
 public class DangerousSettings internal constructor(
     /**
      * Disable or enable syncing purchases automatically. If this is disabled, RevenueCat will not sync any purchase
-     * automatically, and you will have to call syncPurchases whenever a new purchase is completed in order to send it
-     * to the RevenueCat's backend. Auto syncing of purchases is enabled by default.
+     * automatically. Explicit SDK purchases still post their result under the identity captured when they started;
+     * other store updates require an explicit syncPurchases or restorePurchases call. Auto syncing of purchases is
+     * enabled by default.
      */
     public val autoSyncPurchases: Boolean = true,
 

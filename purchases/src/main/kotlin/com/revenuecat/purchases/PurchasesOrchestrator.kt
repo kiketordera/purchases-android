@@ -65,6 +65,7 @@ import com.revenuecat.purchases.common.sdksettings.SdkSettings
 import com.revenuecat.purchases.common.sdksettings.SdkSettingsConfigProvider
 import com.revenuecat.purchases.common.sdksettings.SdkSettingsListener
 import com.revenuecat.purchases.common.sha1
+import com.revenuecat.purchases.common.sha256
 import com.revenuecat.purchases.common.subscriberattributes.SubscriberAttributeKey
 import com.revenuecat.purchases.common.subscriberdimensions.SubscriberDimensionsConfigProvider
 import com.revenuecat.purchases.common.uiconfig.UiConfigProvider
@@ -83,6 +84,7 @@ import com.revenuecat.purchases.common.workflows.WorkflowsConfigProvider
 import com.revenuecat.purchases.customercenter.CustomerCenterListener
 import com.revenuecat.purchases.deeplinks.WebPurchaseRedemptionHelper
 import com.revenuecat.purchases.google.isSuccessful
+import com.revenuecat.purchases.google.originalGooglePurchase
 import com.revenuecat.purchases.identity.Identity
 import com.revenuecat.purchases.identity.IdentityManager
 import com.revenuecat.purchases.interfaces.Callback
@@ -226,6 +228,18 @@ internal class PurchasesOrchestrator(
         localRulesEvaluator = localRulesEvaluator,
     ),
 ) : LifecycleDelegate, CustomActivityLifecycleHandler, SdkSettingsListener {
+
+    // Manual-sync clients must not attribute a delayed Play update to a subsequently selected identity.
+    // Keep this separate from PurchasesState so the public/internal inter-module state API is unchanged.
+    private class ManualPurchaseOwner(
+        val appUserID: String,
+        val isRestore: Boolean,
+        val startedAt: Long,
+        val callbackProductId: String,
+        val callback: PurchaseCallback,
+    )
+    private val manualPurchaseOwners = mutableMapOf<String, ManualPurchaseOwner>()
+    private val manualPurchaseRecovery = ManualPurchaseRecovery(billing, postReceiptHelper, dateProvider)
 
     internal var state: PurchasesState
         get() = purchasesStateCache.purchasesState
@@ -612,6 +626,35 @@ internal class PurchasesOrchestrator(
                 onError = { listener?.onError(it) },
             )
         }
+    }
+
+    @Synchronized
+    fun recoverPendingPurchase(
+        expectedAppUserID: String,
+        productId: String,
+        purchaseStartedAt: Date,
+        callback: PurchaseCallback,
+    ) {
+        manualPurchaseRecovery.recover(
+            expectedAppUserID,
+            productId,
+            purchaseStartedAt.time,
+            eligibleIdentity = {
+                synchronized(this@PurchasesOrchestrator) {
+                    !appConfig.dangerousSettings.autoSyncPurchases && store == Store.PLAY_STORE &&
+                        identityManager.currentAppUserID == expectedAppUserID &&
+                        !identityManager.currentUserIsAnonymous() && manualPurchaseOwners.isEmpty()
+                }
+            },
+            callback = object : PurchaseCallback {
+                override fun onCompleted(storeTransaction: StoreTransaction, customerInfo: CustomerInfo) {
+                    dispatch { callback.onCompleted(storeTransaction, customerInfo) }
+                }
+                override fun onError(error: PurchasesError, userCancelled: Boolean) {
+                    dispatch { callback.onError(error, userCancelled) }
+                }
+            },
+        )
     }
 
     fun syncAmazonPurchase(
@@ -1019,6 +1062,7 @@ internal class PurchasesOrchestrator(
             } else {
                 synchronized(this@PurchasesOrchestrator) {
                     state = state.copy(purchaseCallbacksByProductId = Collections.emptyMap())
+                    manualPurchaseOwners.clear()
                 }
                 updateAllCaches(
                     identityManager.currentAppUserID,
@@ -1033,6 +1077,7 @@ internal class PurchasesOrchestrator(
     fun close() {
         synchronized(this@PurchasesOrchestrator) {
             state = state.copy(purchaseCallbacksByProductId = Collections.emptyMap())
+            manualPurchaseOwners.clear()
         }
         this.backend.close()
         this.remoteConfigManager.close()
@@ -1098,7 +1143,9 @@ internal class PurchasesOrchestrator(
 
     fun showInAppMessagesIfNeeded(activity: Activity, inAppMessageTypes: List<InAppMessageType>) {
         billing.showInAppMessagesIfNeeded(activity, inAppMessageTypes) {
-            syncPurchases()
+            if (appConfig.dangerousSettings.autoSyncPurchases) {
+                syncPurchases()
+            }
         }
     }
 
@@ -1740,10 +1787,13 @@ internal class PurchasesOrchestrator(
     }
 
     private fun getPurchaseCallback(productId: String): PurchaseCallback? {
-        return state.purchaseCallbacksByProductId[productId].also {
-            state = state.copy(
-                purchaseCallbacksByProductId = state.purchaseCallbacksByProductId.filterNot { it.key == productId },
-            )
+        return synchronized(this@PurchasesOrchestrator) {
+            manualPurchaseOwners.remove(productId)
+            state.purchaseCallbacksByProductId[productId].also {
+                state = state.copy(
+                    purchaseCallbacksByProductId = state.purchaseCallbacksByProductId.filterNot { it.key == productId },
+                )
+            }
         }
     }
 
@@ -1756,6 +1806,10 @@ internal class PurchasesOrchestrator(
     private fun getPurchasesUpdatedListener(): BillingAbstract.PurchasesUpdatedListener {
         return object : BillingAbstract.PurchasesUpdatedListener {
             override fun onPurchasesUpdated(purchases: List<StoreTransaction>) {
+                if (!appConfig.dangerousSettings.autoSyncPurchases) {
+                    postManuallyInitiatedPurchases(purchases)
+                    return
+                }
                 val isDeprecatedProductChangeInProgress: Boolean
                 val callbackPair: Pair<SuccessfulPurchaseCallback, ErrorPurchaseCallback>
                 val deprecatedProductChangeListener: ProductChangeCallback?
@@ -1803,13 +1857,93 @@ internal class PurchasesOrchestrator(
         }
     }
 
+    private fun capturePurchaseOwner(
+        productId: String,
+        callback: PurchaseCallback,
+        startedAt: Date,
+    ): String {
+        val owner = identityManager.currentAppUserID
+        if (!appConfig.dangerousSettings.autoSyncPurchases) {
+            manualPurchaseOwners[productId] = ManualPurchaseOwner(
+                owner, allowSharingPlayStoreAccount, startedAt.time, productId, callback,
+            )
+        }
+        return owner
+    }
+
+    private fun canStartPurchase(productId: String): Boolean =
+        !state.purchaseCallbacksByProductId.containsKey(productId) &&
+            (appConfig.dangerousSettings.autoSyncPurchases || !manualPurchaseRecovery.isInProgress)
+
+    private fun postManuallyInitiatedPurchases(purchases: List<StoreTransaction>) {
+        val purchasesByOwner = synchronized(this@PurchasesOrchestrator) {
+            purchases.mapNotNull { purchase ->
+                val owners = purchase.productIds.mapNotNull { productId ->
+                    manualPurchaseOwners[productId]?.takeIf {
+                        state.purchaseCallbacksByProductId.containsKey(productId)
+                    }
+                }.distinct()
+                owners.singleOrNull()?.takeIf { owner ->
+                    // A matching SKU alone cannot distinguish an older pending purchase from this checkout.
+                    // Ambiguous Play updates remain available to an explicit restore instead of being transferred.
+                    store != Store.PLAY_STORE || (
+                        purchase.originalGooglePurchase?.accountIdentifiers?.obfuscatedAccountId ==
+                            owner.appUserID.sha256() &&
+                            purchase.purchaseTime >= owner.startedAt - MANUAL_PURCHASE_CLOCK_SKEW_MILLIS &&
+                            purchase.purchaseTime <= dateProvider.now.time + MANUAL_PURCHASE_CLOCK_SKEW_MILLIS
+                        )
+                }?.let { it to purchase }
+            }.groupBy({ it.first }, { it.second })
+        }
+        purchasesByOwner.forEach { (owner, transactions) ->
+            val callbackPair = getManualPurchaseCompletedCallbacks(owner)
+            postTransactionWithProductDetailsHelper.postTransactions(
+                transactions,
+                owner.isRestore,
+                owner.appUserID,
+                PostReceiptInitiationSource.PURCHASE,
+                sdkOriginated = true,
+                transactionPostSuccess = callbackPair.first,
+                transactionPostError = callbackPair.second,
+            )
+        }
+        if (purchasesByOwner.isNotEmpty()) {
+            flushEvents(Delay.NONE)
+        }
+    }
+
     private fun getAndClearAllPurchaseCallbacks(): List<PurchaseCallback> {
         synchronized(this@PurchasesOrchestrator) {
             state.purchaseCallbacksByProductId.let { purchaseCallbacks ->
                 state = state.copy(purchaseCallbacksByProductId = Collections.emptyMap())
+                manualPurchaseOwners.clear()
                 return@getAndClearAllPurchaseCallbacks purchaseCallbacks.values.toList()
             }
         }
+    }
+
+    private fun getManualPurchaseCallback(owner: ManualPurchaseOwner): PurchaseCallback? =
+        synchronized(this@PurchasesOrchestrator) {
+            if (manualPurchaseOwners[owner.callbackProductId] !== owner ||
+                state.purchaseCallbacksByProductId[owner.callbackProductId] !== owner.callback
+            ) {
+                null
+            } else {
+                getPurchaseCallback(owner.callbackProductId)
+            }
+        }
+
+    private fun getManualPurchaseCompletedCallbacks(
+        owner: ManualPurchaseOwner,
+    ): Pair<SuccessfulPurchaseCallback, ErrorPurchaseCallback> {
+        val onSuccess: SuccessfulPurchaseCallback = { transaction, info ->
+            getManualPurchaseCallback(owner)?.let { callback ->
+                backupManager.dataChanged()
+                dispatch { callback.onCompleted(transaction, info) }
+            }
+        }
+        val onError: ErrorPurchaseCallback = { _, error -> getManualPurchaseCallback(owner)?.dispatch(error) }
+        return Pair(onSuccess, onError)
     }
 
     private fun getPurchaseCompletedCallbacks(): Pair<SuccessfulPurchaseCallback, ErrorPurchaseCallback> {
@@ -1899,12 +2033,16 @@ internal class PurchasesOrchestrator(
             if (!appConfig.finishTransactions) {
                 log(LogIntent.WARNING) { PurchaseStrings.PURCHASE_FINISH_TRANSACTION_FALSE }
             }
-            if (!state.purchaseCallbacksByProductId.containsKey(purchasingData.productId)) {
+            if (canStartPurchase(purchasingData.productId)) {
                 val mapOfProductIdToListener = mapOf(purchasingData.productId to listenerWithDiagnostics)
                 state = state.copy(
                     purchaseCallbacksByProductId = state.purchaseCallbacksByProductId + mapOfProductIdToListener,
                 )
-                userPurchasing = identityManager.currentAppUserID
+                userPurchasing = capturePurchaseOwner(
+                    purchasingData.productId,
+                    listenerWithDiagnostics,
+                    startTime,
+                )
             }
         }
 
@@ -1975,7 +2113,7 @@ internal class PurchasesOrchestrator(
                 log(LogIntent.WARNING) { PurchaseStrings.PURCHASE_FINISH_TRANSACTION_FALSE }
             }
 
-            if (!state.purchaseCallbacksByProductId.containsKey(purchasingData.productId)) {
+            if (canStartPurchase(purchasingData.productId)) {
                 // When using DEFERRED proration mode, callback needs to be associated with the *old* product we are
                 // switching from, because the transaction we receive on successful purchase is for the old product.
                 // We also need to normalize oldProductId by stripping any basePlanId suffix
@@ -1995,7 +2133,7 @@ internal class PurchasesOrchestrator(
                 state = state.copy(
                     purchaseCallbacksByProductId = state.purchaseCallbacksByProductId + mapOfProductIdToListener,
                 )
-                userPurchasing = identityManager.currentAppUserID
+                userPurchasing = capturePurchaseOwner(productId, callbackWithDiagnostics, startTime)
             }
         }
         userPurchasing?.let { appUserID ->
@@ -2013,7 +2151,11 @@ internal class PurchasesOrchestrator(
             val operationInProgressError = PurchasesError(PurchasesErrorCode.OperationAlreadyInProgressError).also {
                 errorLog(it)
             }
-            getAndClearAllPurchaseCallbacks().forEach { it.dispatch(operationInProgressError) }
+            if (appConfig.dangerousSettings.autoSyncPurchases) {
+                getAndClearAllPurchaseCallbacks().forEach { it.dispatch(operationInProgressError) }
+            } else {
+                callbackWithDiagnostics.dispatch(operationInProgressError)
+            }
         }
     }
 
@@ -2168,6 +2310,7 @@ internal class PurchasesOrchestrator(
     // region Static
 
     internal companion object {
+        private const val MANUAL_PURCHASE_CLOCK_SKEW_MILLIS = 30_000L
 
         var platformInfo: PlatformInfo = PlatformInfo(
             flavor = "native",
